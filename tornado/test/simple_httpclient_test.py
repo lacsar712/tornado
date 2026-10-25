@@ -8,6 +8,7 @@
 # an instance of SimpleAsyncHTTPClient. Tests that do not do this will actually be run
 # with the default HTTP client instead, which is sometimes overridden to be a different
 # implementation.
+import asyncio
 import collections
 import errno
 import gzip
@@ -19,12 +20,18 @@ import socket
 import ssl
 import sys
 import typing
+import urllib.parse
 from contextlib import closing
 
 from tornado import gen, version
 from tornado.concurrent import Future
 from tornado.escape import to_unicode, utf8
-from tornado.httpclient import AsyncHTTPClient, HTTPResponse
+from tornado.httpclient import (
+    AsyncHTTPClient,
+    ConnectionFollowScope,
+    HTTPClientConnectionFollowError,
+    HTTPResponse,
+)
 from tornado.httpserver import HTTPServer
 from tornado.http1connection import _MAX_1XX_RESPONSES
 from tornado.httputil import HTTPHeaders, ResponseStartLine
@@ -43,6 +50,8 @@ from tornado.tcpserver import TCPServer
 from tornado.test import httpclient_test
 from tornado.test.httpclient_test import (
     ChunkHandler,
+    ConnectionCloseHandler,
+    ConnectionIdHandler,
     CountdownHandler,
     HelloWorldHandler,
     RedirectHandler,
@@ -56,7 +65,7 @@ from tornado.test.util import (
     refusing_port,
     skipIfNoIPv6,
 )
-from tornado.testing import ExpectLog, gen_test
+from tornado.testing import ExpectLog, bind_unused_port, gen_test
 from tornado.web import Application, RequestHandler, stream_request_body, url
 
 
@@ -1156,3 +1165,197 @@ class ChunkedWithContentLengthTest(AsyncHTTPTestCase):
         ):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch("/chunkwithcl", raise_error=True)
+
+
+class ScopeIdHandler(ConnectionIdHandler):
+    post = ConnectionIdHandler.get
+
+
+class FollowScopeSimpleTestCase(AsyncHTTPTestCase):
+    """SimpleAsyncHTTPClient-specific ConnectionFollowScope behavior."""
+
+    def setUp(self):
+        super().setUp()
+        # A second port serving the same app, for cross-origin redirects.
+        sock, port = bind_unused_port()
+        self.http_server.add_socket(sock)
+        self.__port2 = port
+
+    def get_url2(self, path):
+        return "http://127.0.0.1:%d%s" % (self.__port2, path)
+
+    def get_app(self):
+        return Application(
+            [
+                url("/id", ScopeIdHandler),
+                url("/close", ConnectionCloseHandler),
+                url("/redirect", RedirectHandler),
+            ]
+        )
+
+    def get_http_client(self):
+        return SimpleAsyncHTTPClient(force_instance=True)
+
+    @gen_test
+    def test_scope_exit_closes_the_connection(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(self.get_url("/id"))
+            response.rethrow()
+            stream = scope._record.payload["stream"]
+            self.assertFalse(stream.closed())
+        # Normal simple-client rule applies as soon as the scope ends:
+        # the connection is closed, not kept alive on the client.
+        self.assertTrue(stream.closed())
+        self.assertIsNone(scope._record)
+
+    @gen_test
+    def test_streaming_download_blocks_rebind_and_nested_entry(self):
+        gate = Event()
+        release = Event()
+        chunks = []
+
+        async def streaming_callback(chunk):
+            chunks.append(chunk)
+            gate.set()
+            await release.wait()
+
+        scope = ConnectionFollowScope()
+        with scope:
+            task = asyncio.ensure_future(
+                self.http_client.fetch(
+                    self.get_url("/id"),
+                    streaming_callback=streaming_callback,
+                    request_timeout=10,
+                )
+            )
+            yield gate.wait()
+            # The pinned connection is mid-response: another request fails
+            # instead of opening a second connection.
+            with self.assertRaises(HTTPClientConnectionFollowError):
+                yield self.http_client.fetch(self.get_url("/id"))
+            # Entering a nested scope during the stream fails too.
+            with self.assertRaises(RuntimeError):
+                with ConnectionFollowScope():
+                    pass
+            release.set()
+            response = yield task
+            response.rethrow()
+            # After the stream completes the connection can be used again.
+            follow_up = yield self.http_client.fetch(self.get_url("/id"))
+            follow_up.rethrow()
+            self.assertEqual(follow_up.body, b"".join(chunks))
+
+    @gen_test
+    def test_streaming_upload_blocks_nested_entry_and_rebind(self):
+        entry_failed = Event()
+        rebind_failed = Event()
+
+        async def body_producer(write):
+            write(b"a")
+            # This producer runs while the request is still being sent:
+            # entering a nested scope must fail.
+            try:
+                with ConnectionFollowScope():
+                    pass
+            except RuntimeError:
+                entry_failed.set()
+            # And issuing another request in the same scope must fail.
+            try:
+                await self.http_client.fetch(self.get_url("/id"))
+            except HTTPClientConnectionFollowError:
+                rebind_failed.set()
+            write(b"b")
+
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(
+                self.get_url("/id"),
+                method="POST",
+                body_producer=body_producer,
+                headers={"Content-Length": "2"},
+                request_timeout=10,
+            )
+        response.rethrow()
+        self.assertTrue(entry_failed.is_set())
+        self.assertTrue(rebind_failed.is_set())
+
+    @gen_test
+    def test_http10_response_marks_pinned_connection_dead(self):
+        class RawHttp10Server(TCPServer):
+            async def handle_stream(self, stream, address):
+                try:
+                    await stream.read_until(b"\r\n\r\n")
+                    await stream.write(
+                        b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                    )
+                except Exception:
+                    pass
+                stream.close()
+
+        [listener] = bind_sockets(0, "127.0.0.1", socket.AF_INET)
+        port = listener.getsockname()[1]
+        server = RawHttp10Server()
+        server.add_sockets([listener])
+        try:
+            scope = ConnectionFollowScope()
+            with scope:
+                response = yield self.http_client.fetch("http://127.0.0.1:%d/" % port)
+                self.assertEqual(response.body, b"hello")
+                # The HTTP/1.0 response ended in a close, so the binding is
+                # present but dead; a follow-up must fail, not reconnect.
+                self.assertIsNotNone(scope._record)
+                self.assertTrue(scope._record.dead)
+                with self.assertRaises(HTTPClientConnectionFollowError):
+                    yield self.http_client.fetch("http://127.0.0.1:%d/" % port)
+        finally:
+            server.stop()
+
+    @gen_test
+    def test_cross_origin_redirect_stays_on_pinned_connection(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            first = yield self.http_client.fetch(self.get_url("/id"))
+            first.rethrow()
+            target = self.get_url2("/id")
+            url = self.get_url("/redirect?url=" + urllib.parse.quote(target, safe=""))
+            response = yield self.http_client.fetch(url)
+            response.rethrow()
+            # The second hop was sent over the same TCP connection (which
+            # is attached to the first port's server), so it reports the
+            # same server-side connection identity.
+            self.assertEqual(response.body, first.body)
+
+    @gen_test
+    def test_queued_request_fails_when_scope_exits_first(self):
+        # Saturate the client so a request sits in its queue, and exit the
+        # scope before it runs: the queued request must fail.
+        client = SimpleAsyncHTTPClient(force_instance=True, max_clients=1)
+        gate = Event()
+        release = Event()
+
+        async def holder_callback(chunk):
+            gate.set()
+            await release.wait()
+
+        try:
+            # The holder is not in a scope; it just occupies the client.
+            holder = asyncio.ensure_future(
+                client.fetch(
+                    self.get_url("/id"),
+                    streaming_callback=holder_callback,
+                    request_timeout=10,
+                )
+            )
+            yield gate.wait()
+            scope = ConnectionFollowScope()
+            with scope:
+                future = client.fetch(self.get_url("/id"))
+            # The scope exited before the request could run. Only now let
+            # the holder finish (and free the single client slot).
+            release.set()
+            with self.assertRaises(HTTPClientConnectionFollowError):
+                yield future
+            yield holder
+        finally:
+            client.close()

@@ -12,6 +12,12 @@
    .. autoclass:: AsyncHTTPClient
       :members:
 
+   Connection follow scopes
+   ------------------------
+
+   .. autoclass:: ConnectionFollowScope
+      :members:
+
    Request objects
    ---------------
    .. autoclass:: HTTPRequest
@@ -30,6 +36,9 @@
    .. exception:: HTTPError
 
       Alias for `HTTPClientError`.
+
+   .. autoexception:: HTTPClientConnectionFollowError
+      :members:
 
    Command-line interface
    ----------------------

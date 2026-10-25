@@ -22,6 +22,7 @@ import logging
 import re
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from io import BytesIO
 from typing import Any
@@ -29,12 +30,18 @@ from typing import Any
 import pycurl
 
 from tornado import gen, httputil, ioloop
-from tornado.escape import native_str, utf8
+from tornado.escape import _unicode, native_str, utf8
 from tornado.httpclient import (
     AsyncHTTPClient,
+    ConnectionFollowScope,
+    HTTPClientConnectionFollowError,
     HTTPError,
     HTTPRequest,
     HTTPResponse,
+    _FollowedConnection,
+    _current_follow_scope,
+    _scope_fail_response,
+    _scope_validate_request,
     main,
 )
 from tornado.log import app_log
@@ -182,7 +189,13 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         self._curls = [self._curl_create() for i in range(max_clients)]
         self._free_list = self._curls[:]
         self._requests: collections.deque[
-            tuple[HTTPRequest, Callable[[HTTPResponse], None], float]
+            tuple[
+                HTTPRequest,
+                Callable[[HTTPResponse], None],
+                float,
+                ConnectionFollowScope | None,
+                tuple[Any, ...] | None,
+            ]
         ] = collections.deque()
         self._fds: dict[int, int] = {}
         self._timeout: object | None = None
@@ -209,10 +222,51 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         # instance that will case circular reference.
         self._multi = None  # type: ignore
 
+    @staticmethod
+    def _follow_fingerprint(request: HTTPRequest) -> tuple[Any, ...]:
+        """Identifies everything that must stay constant for two requests to
+        share a pinned easy handle: target endpoint, proxy, and TLS setup."""
+        parsed = urllib.parse.urlsplit(_unicode(request.url))
+        netloc = parsed.netloc
+        if "@" in netloc:
+            _userpass, _, netloc = netloc.rpartition("@")
+        host, port = httputil.split_host_and_port(netloc)
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        return (
+            parsed.scheme,
+            host,
+            port,
+            request.proxy_host,
+            request.proxy_port,
+            request.proxy_username,
+            request.proxy_auth_mode,
+            request.validate_cert,
+            request.ca_certs,
+            request.client_cert,
+            request.client_key,
+            request.network_interface,
+            request.allow_ipv6,
+        )
+
     def fetch_impl(
         self, request: HTTPRequest, callback: Callable[[HTTPResponse], None]
     ) -> None:
-        self._requests.append((request, callback, self.io_loop.time()))
+        scope: ConnectionFollowScope | None = None
+        fingerprint: tuple[Any, ...] | None = None
+        scope = _current_follow_scope()
+        if scope is not None:
+            fingerprint = self._follow_fingerprint(request)
+            try:
+                _scope_validate_request(self, request, fingerprint, scope=scope)
+            except HTTPClientConnectionFollowError as e:
+                _scope_fail_response(self, request, e, callback)
+                return
+        self._requests.append(
+            (request, callback, self.io_loop.time(), scope, fingerprint)
+        )
         self._process_queue()
         self._set_timeout(0)
 
@@ -321,10 +375,70 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
     def _process_queue(self) -> None:
         while True:
             started = 0
-            while self._free_list and self._requests:
+            while self._requests:
+                (
+                    request,
+                    callback,
+                    queue_start_time,
+                    scope,
+                    fingerprint,
+                ) = self._requests[0]
+                record: _FollowedConnection | None = None
+                if scope is not None:
+                    if scope._owner is None:
+                        # The scope was exited while the request was queued.
+                        self._requests.popleft()
+                        _scope_fail_response(
+                            self,
+                            request,
+                            HTTPClientConnectionFollowError(
+                                "the ConnectionFollowScope was exited before "
+                                "the request ran"
+                            ),
+                            callback,
+                        )
+                        started += 1
+                        continue
+                    record = scope._effective_record()
+                    if record is not None:
+                        try:
+                            _scope_validate_request(
+                                self,
+                                request,
+                                fingerprint or (),
+                                scope=scope,
+                            )
+                        except HTTPClientConnectionFollowError as e:
+                            self._requests.popleft()
+                            _scope_fail_response(self, request, e, callback)
+                            started += 1
+                            continue
+                        curl = record.payload.get("curl")
+                        if curl is None:
+                            self._requests.popleft()
+                            _scope_fail_response(
+                                self,
+                                request,
+                                HTTPClientConnectionFollowError(
+                                    "the pinned connection is closed or no "
+                                    "longer usable"
+                                ),
+                                callback,
+                            )
+                            started += 1
+                            continue
+                    elif not self._free_list:
+                        # Wait for an unpinned handle to become free; pinned
+                        # handles are never taken for a new binding.
+                        break
+                    else:
+                        curl = self._free_list.pop()
+                elif not self._free_list:
+                    break
+                else:
+                    curl = self._free_list.pop()
+                self._requests.popleft()
                 started += 1
-                curl = self._free_list.pop()
-                request, callback, queue_start_time = self._requests.popleft()
                 # TODO: Don't smuggle extra data on an attribute of the Curl object.
                 curl.info = {  # type: ignore
                     "headers": httputil.HTTPHeaders(),
@@ -336,6 +450,8 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                     "queue_start_time": queue_start_time,
                     "curl_start_time": time.time(),
                     "curl_start_ioloop_time": self.io_loop.current().time(),
+                    "follow_scope": scope,
+                    "follow_record": None,
                 }
                 try:
                     self._curl_setup_request(
@@ -343,6 +459,7 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                         request,
                         curl.info["buffer"],  # type: ignore
                         curl.info["headers"],  # type: ignore
+                        record,
                     )
                 except Exception as e:
                     # If there was an error in setup, pass it on
@@ -354,13 +471,67 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                     # _finish_pending_requests the exceptions have
                     # nowhere to go.
                     curl.reset()
-                    self._free_list.append(curl)
+                    if record is not None and scope is not None:
+                        self._follow_detach_record(record, scope)
+                    else:
+                        self._free_list.append(curl)
                     callback(HTTPResponse(request=request, code=599, error=e))
                 else:
                     self._multi.add_handle(curl)
+                    if scope is not None:
+                        pending_bind = False
+                        if record is None:
+                            assert fingerprint is not None
+                            record = _FollowedConnection(
+                                type(self),
+                                fingerprint,
+                                {"curl": curl, "transfers": 0},
+                                self._follow_release_record,
+                            )
+                            # The handle is reserved for this transfer but
+                            # only bound to the scope once it succeeds; a
+                            # failed first attempt leaves the scope unbound
+                            # so the next request follows the normal rules.
+                            pending_bind = True
+                        elif scope._record is None:
+                            # Inner scope borrowing an enclosing scope's
+                            # handle: also binds on success only.
+                            pending_bind = True
+                        curl.info["follow_record"] = record  # type: ignore
+                        curl.info["follow_pending_bind"] = pending_bind  # type: ignore
+                        record.retain()  # released in _finish
+                        record.busy = True
+                        record.streaming = bool(request.streaming_callback)
+                        scope._request_active = True
+                        scope._streaming = bool(request.streaming_callback)
 
             if not started:
                 break
+
+    def _follow_detach_record(
+        self, record: _FollowedConnection, scope: ConnectionFollowScope
+    ) -> None:
+        """Marks a pinned curl handle dead and returns it to the pool."""
+        record.mark_dead()
+        curl = record.payload.pop("curl", None)
+        if curl is not None:
+            try:
+                curl.reset()
+            except Exception:
+                pass
+            self._free_list.append(curl)
+        scope._request_active = False
+        scope._streaming = False
+        record.busy = False
+        record.streaming = False
+
+    def _follow_release_record(self, record: _FollowedConnection) -> None:
+        # Normal rule for a curl handle: return it to the shared pool, where
+        # libcurl keeps its own (unpinned) connection cache as before.
+        curl = record.payload.pop("curl", None)
+        if curl is not None:
+            self._free_list.append(curl)
+        self._process_queue()
 
     def _finish(
         self,
@@ -382,13 +553,27 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
             except Exception:
                 self.handle_callback_exception(info["request"].streaming_callback)
         buffer = info["buffer"]
+        record = info["follow_record"]
+        scope = info["follow_scope"]
         if curl_error:
             assert curl_message is not None
             if body_too_large:
                 curl_message = "body exceeded max_body_size of %d bytes" % (
                     self.max_body_size,
                 )
-            error: CurlError | None = CurlError(curl_error, curl_message)
+            if record is not None:
+                # A pinned transfer that could not complete (notably one
+                # whose connection was closed) must report as a follow
+                # failure instead of looking like an ordinary retryable
+                # transport error.
+                error: CurlError | HTTPClientConnectionFollowError | None = (
+                    HTTPClientConnectionFollowError(
+                        "the pinned connection could not be reused: %s"
+                        % curl_message
+                    )
+                )
+            else:
+                error = CurlError(curl_error, curl_message)
             assert error is not None
             code = error.code
             effective_url = None
@@ -399,6 +584,30 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
             code = curl.getinfo(pycurl.HTTP_CODE)
             effective_url = curl.getinfo(pycurl.EFFECTIVE_URL)
             buffer.seek(0)
+        if record is not None and error is None:
+            # The first transfer on a pinned handle may reuse a connection
+            # libcurl still had cached or open exactly one new connection,
+            # but a cross-origin redirect must not add a second one. Every
+            # later transfer must open zero new connections (this is also
+            # enforced up-front by the OPENSOCKETFUNCTION guard).
+            transfers = record.payload.get("transfers", 0) + 1
+            record.payload["transfers"] = transfers
+            num_connects: int | None = None
+            if hasattr(pycurl, "NUM_CONNECTS"):
+                try:
+                    num_connects = curl.getinfo(pycurl.NUM_CONNECTS)
+                except Exception:
+                    num_connects = None
+            max_connects = 1 if transfers == 1 else 0
+            if num_connects is not None and num_connects > max_connects:
+                error = HTTPClientConnectionFollowError(
+                    "the transfer did not reuse the pinned connection"
+                )
+                code = 599
+                effective_url = None
+                if buffer is not None:
+                    buffer.close()
+                    buffer = None
         # the various curl timings are documented at
         # http://curl.haxx.se/libcurl/c/curl_easy_getinfo.html
         time_info = dict(
@@ -429,7 +638,31 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         except Exception:
             self.handle_callback_exception(info["callback"])
         curl.reset()
-        self._free_list.append(curl)
+        if record is not None:
+            record.busy = False
+            record.streaming = False
+            if scope is not None:
+                scope._request_active = False
+                scope._streaming = False
+            pending_bind = info.get("follow_pending_bind", False)
+            if error is not None:
+                # Any failure (including a transfer that would not reuse the
+                # connection) tears the connection down. If this scope had
+                # not bound it yet, it stays unbound so its next request may
+                # acquire a connection by the normal rules; a borrowed
+                # record stays marked dead for every scope holding it.
+                record.mark_dead()
+                record.payload["curl"] = None
+                self._free_list.append(curl)
+            elif pending_bind and scope is not None and scope._record is None:
+                # The request succeeded: now the connection is bound.
+                scope._bind(record)
+            # On a successful already-bound transfer the handle stays parked
+            # in the record; it only returns to the pool when the last scope
+            # releases it.
+            record.release()
+        else:
+            self._free_list.append(curl)
 
     def handle_callback_exception(self, callback: Any) -> None:
         app_log.error("Exception in callback %r", callback, exc_info=True)
@@ -443,7 +676,26 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         request: HTTPRequest,
         buffer: BytesIO,
         headers: httputil.HTTPHeaders,
+        follow_record: _FollowedConnection | None = None,
     ) -> None:
+        if follow_record is not None and hasattr(pycurl, "OPENSOCKETFUNCTION"):
+            # The first transfer opened (and cached) the one allowed
+            # connection. Refuse to let libcurl open any further socket for
+            # this pinned handle, so a redirect hop or reuse attempt that
+            # cannot stay on that connection fails instead of silently
+            # switching to a new one.
+            first_transfer = follow_record.payload.get("transfers", 0) == 0
+            if not first_transfer:
+                bad_socket = getattr(pycurl, "SOCKET_BAD", -1)
+
+                def reject_new_socket(purpose: int, address: object) -> int:
+                    curl_log.debug(
+                        "follow scope rejecting new curl socket (purpose %s)",
+                        purpose,
+                    )
+                    return bad_socket
+
+                curl.setopt(pycurl.OPENSOCKETFUNCTION, reject_new_socket)
         if curl_log.isEnabledFor(logging.DEBUG):
             curl.setopt(pycurl.VERBOSE, 1)
             curl.setopt(pycurl.DEBUGFUNCTION, self._curl_debug)

@@ -9,6 +9,7 @@
 #
 # Test cases that are for specific implementation details of one of the client implementations
 # should go into the respective test file (simple_httpclient_test.py, curl_httpclient_test.py).
+import asyncio
 import base64
 import binascii
 import contextlib
@@ -32,7 +33,9 @@ from tornado.escape import utf8, native_str, to_unicode, json_encode, json_decod
 from tornado import gen, netutil
 from tornado.locks import Event
 from tornado.httpclient import (
+    ConnectionFollowScope,
     HTTPClient,
+    HTTPClientConnectionFollowError,
     HTTPError,
     HTTPRequest,
     HTTPResponse,
@@ -282,10 +285,48 @@ class BrotliBombHandler(RequestHandler):
 class LargeBodyHandler(RequestHandler):
     def get(self):
         # An incompressible content type, so that the server's gzip
-        # transform leaves the body alone and this exercises the plain
+        # transform leaves the response alone and this exercises the plain
         # streaming path.
         self.set_header("Content-Type", "application/octet-stream")
         self.write(large_body())
+
+
+def server_connection_id(handler: RequestHandler) -> str:
+    """Identifies the server-side TCP connection of an in-progress request.
+
+    Two requests sharing one connection report the same client-side port.
+    Empty on transports that do not expose a stream (e.g. http/2).
+    """
+    stream = getattr(handler.request.connection, "stream", None)
+    socket = getattr(stream, "socket", None)
+    if socket is None:
+        return ""
+    return str(socket.getpeername()[1])
+
+
+class ConnectionIdHandler(RequestHandler):
+    def get(self):
+        self.write(server_connection_id(self))
+
+
+class ConnectionCloseHandler(RequestHandler):
+    def get(self):
+        self.set_header("Connection", "close")
+        self.write("bye")
+
+
+class ConnectionTraceHandler(RequestHandler):
+    # Records the server-side connection used by each request (redirect
+    # hops included). Reset by individual tests.
+    trace: list[str] = []
+
+    def get(self, count: str) -> None:
+        ConnectionTraceHandler.trace.append(server_connection_id(self))
+        n = int(count)
+        if n > 0:
+            self.redirect("/conn_trace/%d" % (n - 1))
+        else:
+            self.write("zero")
 
 
 # These tests end up getting run redundantly: once here with the default
@@ -327,6 +368,9 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
                 url("/gzip_bomb", GzipBombHandler),
                 url("/brotli_bomb", BrotliBombHandler),
                 url("/large_body", LargeBodyHandler),
+                url("/connection_id", ConnectionIdHandler),
+                url("/connection_close", ConnectionCloseHandler),
+                url("/conn_trace/([0-9]+)", ConnectionTraceHandler),
             ],
             gzip=True,
         )
@@ -1106,6 +1150,184 @@ X-XSS-Protection: 1;
                         "Authorization" in echoed_headers or "Cookie" in echoed_headers
                     )
 
+    # ------------------------------------------------------------------
+    # ConnectionFollowScope tests (run against every client implementation)
+    # ------------------------------------------------------------------
+
+    def test_follow_scope_reentry_same_task_fails(self):
+        # No event loop interaction needed, but the test still runs on every
+        # implementation as a member of this class.
+        scope = ConnectionFollowScope()
+        with scope:
+            with self.assertRaises(RuntimeError):
+                with scope:
+                    pass
+
+    def test_follow_scope_context_manager_protocol(self):
+        # Both sync and async context manager protocols are supported.
+        import inspect
+
+        scope = ConnectionFollowScope()
+        self.assertTrue(hasattr(scope, "__enter__"))
+        self.assertTrue(inspect.iscoroutinefunction(scope.__aenter__))
+
+    @gen_test
+    def test_follow_scope_reuses_connection(self):
+        scope = ConnectionFollowScope()
+        bodies = []
+        with scope:
+            for i in range(3):
+                response = yield self.http_client.fetch(self.get_url("/connection_id"))
+                response.rethrow()
+                bodies.append(response.body)
+        if not bodies[0]:
+            self.skipTest("transport does not expose connection identity")
+        self.assertEqual(len(set(bodies)), 1)
+        # Leaving the scope drops the binding; nothing is kept on the client.
+        self.assertIsNone(scope._record)
+
+    @gen_test
+    def test_follow_scope_requests_after_exit_are_unaffected(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(self.get_url("/connection_id"))
+            response.rethrow()
+        response = yield self.http_client.fetch(self.get_url("/connection_id"))
+        response.rethrow()
+        self.assertEqual(response.code, 200)
+
+    @gen_test
+    def test_follow_scope_nested(self):
+        outer = ConnectionFollowScope()
+        with outer:
+            ro = yield self.http_client.fetch(self.get_url("/connection_id"))
+            inner = ConnectionFollowScope()
+            with inner:
+                # The inner scope sees and uses the outer binding; on success
+                # it binds the same record itself.
+                ri1 = yield self.http_client.fetch(self.get_url("/connection_id"))
+                ri2 = yield self.http_client.fetch(self.get_url("/connection_id"))
+                self.assertIs(inner._record, outer._record)
+            # Exiting the inner scope leaves the outer binding in place.
+            self.assertIsNotNone(outer._record)
+            ro2 = yield self.http_client.fetch(self.get_url("/connection_id"))
+        bodies = [response.body for response in (ro, ri1, ri2, ro2)]
+        if not bodies[0]:
+            self.skipTest("transport does not expose connection identity")
+        self.assertEqual(len(set(bodies)), 1)
+
+    @gen_test
+    def test_follow_scope_siblings_are_independent(self):
+        scope_a = ConnectionFollowScope()
+        with scope_a:
+            a1 = yield self.http_client.fetch(self.get_url("/connection_id"))
+            a2 = yield self.http_client.fetch(self.get_url("/connection_id"))
+            record_a = scope_a._record
+        scope_b = ConnectionFollowScope()
+        with scope_b:
+            b1 = yield self.http_client.fetch(self.get_url("/connection_id"))
+            b2 = yield self.http_client.fetch(self.get_url("/connection_id"))
+            record_b = scope_b._record
+        self.assertIsNot(record_a, record_b)
+        self.assertEqual(a1.body, a2.body)
+        self.assertEqual(b1.body, b2.body)
+
+    @gen_test
+    def test_follow_scope_concurrent_tasks_cannot_enter(self):
+        scope = ConnectionFollowScope()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_scope():
+            with scope:
+                entered.set()
+                await release.wait()
+
+        task1 = asyncio.ensure_future(hold_scope())
+        yield entered.wait()
+        task2 = asyncio.ensure_future(hold_scope())
+        # Let task2 run up to its failed scope entry.
+        for i in range(10):
+            if task2.done():
+                break
+            yield gen.sleep(0.02)
+        self.assertTrue(task2.done())
+        with self.assertRaises(RuntimeError):
+            task2.result()
+        release.set()
+        yield task1
+
+    @gen_test
+    def test_follow_scope_target_mismatch_fails(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(self.get_url("/connection_id"))
+            response.rethrow()
+            with self.assertRaises(HTTPClientConnectionFollowError):
+                yield self.http_client.fetch(self.get_url2("/connection_id"))
+
+    @gen_test
+    def test_follow_scope_redirects_stay_on_connection(self):
+        ConnectionTraceHandler.trace = []
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(self.get_url("/conn_trace/3"))
+        response.rethrow()
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"zero")
+        trace = ConnectionTraceHandler.trace
+        self.assertEqual(len(trace), 4)
+        if not trace[0]:
+            self.skipTest("transport does not expose connection identity")
+        self.assertEqual(len(set(trace)), 1)
+
+    @gen_test
+    def test_follow_scope_closed_connection_fails(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            response = yield self.http_client.fetch(self.get_url("/connection_close"))
+            response.rethrow()
+            # The peer closed the pinned connection; the next request must
+            # fail rather than quietly opening a new one.
+            with self.assertRaises(HTTPClientConnectionFollowError):
+                yield self.http_client.fetch(self.get_url("/connection_id"))
+
+    @gen_test
+    def test_follow_scope_unbound_first_failure_allows_retry(self):
+        from tornado.test.util import refusing_port
+
+        cleanup, port = refusing_port()
+        try:
+            scope = ConnectionFollowScope()
+            with scope:
+                with self.assertRaises(HTTPError):
+                    yield self.http_client.fetch(
+                        "http://127.0.0.1:%d/connection_id" % port,
+                        connect_timeout=1,
+                        request_timeout=2,
+                    )
+                # Nothing was ever bound: the next request follows the
+                # normal connection rules and succeeds.
+                self.assertIsNone(scope._record)
+                response = yield self.http_client.fetch(self.get_url("/connection_id"))
+                response.rethrow()
+                self.assertEqual(response.code, 200)
+        finally:
+            cleanup()
+
+    @gen_test
+    def test_follow_scope_failure_is_a_599_error(self):
+        # Like other transport failures, a follow failure is a 599 error;
+        # raise_error=False only suppresses actual HTTP response codes.
+        scope = ConnectionFollowScope()
+        with scope:
+            yield self.http_client.fetch(self.get_url("/connection_close"))
+            with self.assertRaises(HTTPClientConnectionFollowError) as cm:
+                yield self.http_client.fetch(
+                    self.get_url("/connection_id"), raise_error=False
+                )
+            self.assertEqual(cm.exception.code, 599)
+
 
 class RequestProxyTest(TestCase):
     def test_request_set(self):
@@ -1158,7 +1380,12 @@ class SyncHTTPClientTest(TestCase):
         @gen.coroutine
         def init_server():
             sock, self.port = bind_unused_port()
-            app = Application([("/", HelloWorldHandler)])
+            app = Application(
+                [
+                    ("/", HelloWorldHandler),
+                    ("/connection_id", ConnectionIdHandler),
+                ]
+            )
             self.server = HTTPServer(app)
             self.server.add_socket(sock)
             event.set()
@@ -1211,6 +1438,24 @@ class SyncHTTPClientTest(TestCase):
         with self.assertRaises(HTTPError) as assertion:
             self.http_client.fetch(self.get_url("/notfound"))
         self.assertEqual(assertion.exception.code, 404)
+
+    def test_sync_client_follow_scope_reuses_connection(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            first = self.http_client.fetch(self.get_url("/connection_id"))
+            second = self.http_client.fetch(self.get_url("/connection_id"))
+        third = self.http_client.fetch(self.get_url("/connection_id"))
+        self.assertEqual(first.code, 200)
+        self.assertEqual(second.code, third.code)
+        self.assertEqual(first.body, second.body)
+        self.assertIsNone(scope._record)
+
+    def test_sync_client_follow_scope_reentry_fails(self):
+        scope = ConnectionFollowScope()
+        with scope:
+            with self.assertRaises(RuntimeError):
+                with scope:
+                    pass
 
 
 class SyncHTTPClientSubprocessTest(TestCase):

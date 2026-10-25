@@ -36,9 +36,12 @@ To select ``curl_httpclient``, call `AsyncHTTPClient.configure` at startup::
     AsyncHTTPClient.configure("tornado.curl_httpclient.CurlAsyncHTTPClient")
 """
 
+import asyncio
+import contextvars
 import datetime
 import functools
 import ssl
+import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable
@@ -755,6 +758,284 @@ class _RequestProxy:
             return self.defaults.get(name, None)
         else:
             return None
+
+
+class HTTPClientConnectionFollowError(HTTPClientError):
+    """Error raised when a request inside a `ConnectionFollowScope` cannot
+    be served on the scope's pinned connection.
+
+    The request fails instead of silently opening another connection (or
+    switching to another proxy, TLS configuration, or client
+    implementation). For historical reasons this is a 599 error like the
+    other transport-level failures.
+
+    .. versionadded:: 6.7
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(599, message=message)
+
+
+# Holds the innermost currently-active scope for this context (asyncio
+# task / thread). Context variables follow the task that entered the scope,
+# including across ``await`` points and into the private IOLoop used by the
+# blocking ``HTTPClient``.
+_follow_scope_contextvar: "contextvars.ContextVar[ConnectionFollowScope | None]" = (
+    contextvars.ContextVar("tornado_httpclient_connection_follow_scope", default=None)
+)
+
+
+def _current_follow_scope() -> "Optional[ConnectionFollowScope]":
+    """Returns the innermost active `ConnectionFollowScope`, if any."""
+    return _follow_scope_contextvar.get()
+
+
+class _FollowedConnection:
+    """A single connection pinned to one or more `ConnectionFollowScope` objects.
+
+    Instances are created by the client implementations; this class holds
+    only the bookkeeping that is common to all implementations. ``payload``
+    is an opaque object chosen by the implementation (the stream and
+    ``HTTP1Connection`` for ``simple_httpclient``, the pycurl easy handle for
+    ``curl_httpclient``).
+    """
+
+    def __init__(
+        self,
+        impl_class: type,
+        fingerprint: tuple[Any, ...],
+        payload: Any,
+        on_release: "Callable[[_FollowedConnection], None]",
+    ) -> None:
+        self.impl_class = impl_class
+        self.fingerprint = fingerprint
+        self.payload = payload
+        self._on_release = on_release
+        # Number of scopes (plus in-flight requests) keeping this record.
+        self.refs = 0
+        # True once the connection has broken or cannot carry another
+        # request. Never goes back to False: the scope must not reconnect.
+        self.dead = False
+        # True while a request is being sent or received on this connection.
+        self.busy = False
+        # True while a streaming upload (``body_producer``) or streaming
+        # download (``streaming_callback``) owns this connection.
+        self.streaming = False
+        self._released = False
+
+    def retain(self) -> None:
+        self.refs += 1
+
+    def release(self) -> None:
+        self.refs -= 1
+        if self.refs <= 0 and not self._released:
+            self._released = True
+            self._on_release(self)
+
+    def mark_dead(self) -> None:
+        self.dead = True
+
+
+class ConnectionFollowScope:
+    """Keeps all requests issued within the scope on one connection.
+
+    Enter the scope explicitly with a ``with`` (or ``async with``)
+    statement::
+
+        scope = httpclient.ConnectionFollowScope()
+        async with scope:
+            await http_client.fetch(url1)
+            await http_client.fetch(url2)  # reuses url1's connection
+
+    The first request issued in the scope acquires a connection following
+    the normal rules; once it has been sent successfully the connection is
+    bound to *the scope only* (never to the client). All later requests in
+    the same scope reuse that connection. If it cannot be used -- it
+    closed, the peer asked to close it, a proxy/TLS/client-implementation
+    setting would differ, or another request is already in flight on it --
+    the request fails with `.HTTPClientConnectionFollowError` instead of
+    opening another connection. Every redirect hop stays on the same
+    connection too.
+
+    Scopes are independent and may nest:
+
+    * Two sibling scopes never share a binding.
+    * An inner scope sees the outer scope's binding until its own first
+      request succeeds; afterwards the inner scope uses its own binding and
+      the outer binding is untouched when the inner scope exits.
+    * The same scope object cannot be entered by two concurrent tasks, and
+      a task cannot re-enter a scope it has not left.
+    * When a streaming request (``body_producer`` or
+      ``streaming_callback``) is in progress, entering another scope or
+      issuing another request in the same scope fails.
+
+    When the scope exits, the binding disappears; the connection is then
+    closed or returned to the implementation's normal pool exactly as it
+    would have been without the scope.
+
+    Both the blocking `HTTPClient` and `AsyncHTTPClient` honor these
+    scopes, as do the simple and curl implementations.
+
+    .. versionadded:: 6.7
+    """
+
+    def __init__(self) -> None:
+        # (thread id, asyncio task id) of the task that entered the scope,
+        # or None when the scope is not active.
+        self._owner: tuple[int, Optional[int]] | None = None
+        self._token: "contextvars.Token[ConnectionFollowScope | None] | None" = None
+        self._parent: "Optional[ConnectionFollowScope]" = None
+        self._record: _FollowedConnection | None = None
+        # True for the lifetime of a request running under this scope,
+        # including before the connection has been bound.
+        self._request_active = False
+        # True when the active request uses body_producer or a
+        # streaming_callback; mirrored onto the record once a connection is
+        # bound so inner scopes can see it too.
+        self._streaming = False
+
+    @staticmethod
+    def _owner_id() -> tuple[int, Optional[int]]:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover - no running loop
+            task = None
+        return (threading.get_ident(), id(task) if task is not None else None)
+
+    def __enter__(self) -> "ConnectionFollowScope":
+        owner = self._owner_id()
+        if self._owner is not None:
+            if self._owner == owner:
+                raise RuntimeError(
+                    "ConnectionFollowScope entered again before it was exited"
+                )
+            raise RuntimeError(
+                "ConnectionFollowScope is already entered by another task"
+            )
+        parent = _follow_scope_contextvar.get()
+        ancestor = parent
+        while ancestor is not None:
+            if ancestor._request_active and ancestor._streaming:
+                raise RuntimeError(
+                    "cannot enter a ConnectionFollowScope while a streaming "
+                    "request is in progress in an enclosing scope"
+                )
+            ancestor = ancestor._parent
+        self._parent = parent
+        self._owner = owner
+        self._token = _follow_scope_contextvar.set(self)
+        return self
+
+    def __exit__(self, typ: object, value: object, tb: object) -> None:
+        if self._owner is None:
+            return
+        assert self._token is not None
+        _follow_scope_contextvar.reset(self._token)
+        self._token = None
+        self._owner = None
+        self._parent = None
+        self._request_active = False
+        self._streaming = False
+        record = self._record
+        self._record = None
+        if record is not None:
+            record.release()
+
+    async def __aenter__(self) -> "ConnectionFollowScope":
+        return self.__enter__()
+
+    async def __aexit__(self, typ: object, value: object, tb: object) -> None:
+        self.__exit__(typ, value, tb)
+
+    # ------------------------------------------------------------------
+    # Hooks used by the client implementations.
+    # ------------------------------------------------------------------
+
+    def _effective_record(self) -> "_FollowedConnection | None":
+        """The record visible from this scope: this scope's own binding, or
+        the nearest enclosing scope's binding."""
+        node: "ConnectionFollowScope | None" = self
+        while node is not None:
+            if node._record is not None:
+                return node._record
+            node = node._parent
+        return None
+
+    def _bind(self, record: _FollowedConnection) -> None:
+        assert self._record is None
+        record.retain()
+        self._record = record
+
+
+def _scope_validate_request(
+    client: AsyncHTTPClient,
+    request: HTTPRequest,
+    fingerprint: tuple[Any, ...],
+    scope: "Optional[ConnectionFollowScope]" = None,
+) -> "tuple[ConnectionFollowScope | None, _FollowedConnection | None]":
+    """Performs the checks a client implementation needs before it starts
+    work on a request.
+
+    Returns ``(scope, record)``: the active scope (if any) and the already
+    bound connection visible from that scope (if any). Raises
+    `.HTTPClientConnectionFollowError` when the request cannot proceed.
+
+    ``scope`` may be a snapshot taken at enqueue time; implementations
+    whose requests pass through a queue pass the snapshot here instead of
+    relying on the current context.
+    """
+    active_scope = scope if scope is not None else _follow_scope_contextvar.get()
+    if active_scope is None:
+        return None, None
+    scope = active_scope
+    if scope._owner is None:
+        raise HTTPClientConnectionFollowError(
+            "the ConnectionFollowScope was exited before the request ran"
+        )
+    node: ConnectionFollowScope | None = scope
+    while node is not None:
+        if node._request_active and node._streaming:
+            raise HTTPClientConnectionFollowError(
+                "a streaming request is in progress in the follow scope"
+            )
+        node = node._parent
+    if scope._request_active:
+        raise HTTPClientConnectionFollowError(
+            "another request is already in progress in the follow scope"
+        )
+    record = scope._effective_record()
+    if record is None:
+        return scope, None
+    if record.dead:
+        raise HTTPClientConnectionFollowError(
+            "the pinned connection is closed or no longer usable"
+        )
+    if record.busy:
+        raise HTTPClientConnectionFollowError(
+            "the pinned connection is busy with another request"
+        )
+    if record.streaming:
+        raise HTTPClientConnectionFollowError(
+            "a streaming request is in progress on the pinned connection"
+        )
+    if record.impl_class is not type(client) or record.fingerprint != fingerprint:
+        raise HTTPClientConnectionFollowError(
+            "the request would use a different connection (target, proxy, "
+            "TLS settings, or client implementation)"
+        )
+    return scope, record
+
+
+def _scope_fail_response(
+    client: AsyncHTTPClient,
+    request: HTTPRequest,
+    error: BaseException,
+    callback: Callable[[HTTPResponse], None],
+) -> None:
+    """Schedules a 599 failure response for a request that could not even
+    be started inside a follow scope."""
+    response = HTTPResponse(request=request, code=599, error=error)
+    client.io_loop.add_callback(callback, response)
 
 
 def main() -> None:
