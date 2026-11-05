@@ -37,6 +37,7 @@ __all__ = [
     "gen",
     "http1connection",
     "httpclient",
+    "httpclient_policy",
     "httpserver",
     "httputil",
     "ioloop",

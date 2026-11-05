@@ -13,7 +13,7 @@ from io import BytesIO
 from types import TracebackType
 from typing import Any, Optional, Type
 
-from tornado import gen, httputil, version
+from tornado import gen, httpclient_policy, httputil, version
 from tornado.escape import _unicode
 from tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
 from tornado.httpclient import (
@@ -157,6 +157,21 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     def fetch_impl(
         self, request: HTTPRequest, callback: Callable[[HTTPResponse], None]
     ) -> None:
+        view = getattr(request, "_policy_view", None)
+        if (
+            httpclient_policy._fail_fast_active(view)
+            and len(self.active) >= self.max_clients
+        ):
+            # This request would enter the max_clients queue; the active
+            # frame demands immediate failure instead. No slot is taken.
+            error = httpclient_policy.OutboundQueueFull(
+                "outbound fetch failed fast by queue_gate=fail_fast policy "
+                f"frame: client already at max_clients={self.max_clients} "
+                "capacity",
+                gate=httpclient_policy.QueueGate.FAIL_FAST.value,
+            )
+            self.io_loop.add_callback(callback, HTTPResponse(request, 599, error=error))
+            return
         key = object()
         self.queue.append((key, request, callback))
         assert request.connect_timeout is not None
@@ -169,6 +184,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 or request.request_timeout
             )  # min but skip zero
             if timeout:
+                httpclient_policy._timeout_will_arm(view, "queue")
                 timeout_handle = self.io_loop.add_timeout(
                     self.io_loop.time() + timeout,
                     functools.partial(self._on_timeout, key, "in request queue"),
@@ -220,6 +236,9 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
             request, callback, timeout_handle = self.waiting[key]
             if timeout_handle is not None:
                 self.io_loop.remove_timeout(timeout_handle)
+                httpclient_policy._timeout_did_disarm(
+                    getattr(request, "_policy_view", None), "queue"
+                )
             del self.waiting[key]
 
     def _on_timeout(self, key: object, info: str | None = None) -> None:
@@ -232,6 +251,9 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         """
         request, callback, timeout_handle = self.waiting[key]
         self.queue.remove((key, request, callback))
+        httpclient_policy._timeout_did_disarm(
+            getattr(request, "_policy_view", None), "queue"
+        )
 
         error_message = f"Timeout {info}" if info else "Timeout"
         timeout_response = HTTPResponse(
@@ -275,6 +297,12 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         self._decompressor = None
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout: object = None
+        # Resolved outbound policy view for this connection (None when no
+        # policy frame covered the fetch).
+        self._policy_view = getattr(request, "_policy_view", None)
+        # Whether the whole-request timeout registered itself as armed on
+        # the governing policy frame.
+        self._policy_request_armed = False
         self._sockaddr = None
         IOLoop.current().add_future(
             gen.convert_yielded(self.run()), lambda f: f.result()
@@ -325,6 +353,11 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 timeout = self.request.request_timeout
             else:
                 timeout = 0
+            connect_timeout_armed = bool(timeout)
+            if connect_timeout_armed:
+                httpclient_policy._timeout_will_arm(
+                    self._policy_view, "connect"
+                )
             try:
                 stream = await self.tcp_client.connect(
                     host,
@@ -343,6 +376,11 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 # TCPClient's timeout messages describe which phase of
                 # the connection timed out (DNS, TCP, or TLS).
                 raise HTTPTimeoutError(str(e) or "Timeout while connecting") from None
+            finally:
+                if connect_timeout_armed:
+                    httpclient_policy._timeout_did_disarm(
+                        self._policy_view, "connect"
+                    )
 
             if self.final_callback is None:
                 # final_callback is cleared if we've hit our timeout.
@@ -354,6 +392,8 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             if self.final_callback is None:
                 return
             if self.request.request_timeout:
+                httpclient_policy._timeout_will_arm(self._policy_view, "request")
+                self._policy_request_armed = True
                 self._timeout = self.io_loop.add_timeout(
                     self.start_time + self.request.request_timeout,
                     functools.partial(self._on_timeout, "during request"),
@@ -477,6 +517,11 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             return ssl_ctx
         return None
 
+    def _disarm_policy_request_timeout(self) -> None:
+        if self._policy_request_armed:
+            self._policy_request_armed = False
+            httpclient_policy._timeout_did_disarm(self._policy_view, "request")
+
     def _on_timeout(self, info: str | None = None) -> None:
         """Timeout callback of _HTTPConnection instance.
 
@@ -485,6 +530,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         :info string key: More detailed timeout information.
         """
         self._timeout = None
+        self._disarm_policy_request_timeout()
         error_message = f"Timeout {info}" if info else "Timeout"
         if self.final_callback is not None:
             self._handle_exception(
@@ -495,6 +541,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         if self._timeout is not None:
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
+        self._disarm_policy_request_timeout()
 
     def _create_connection(self, stream: IOStream) -> HTTP1Connection:
         stream.set_nodelay(True)
@@ -703,7 +750,9 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             self.final_callback = None  # type: ignore
             self._release()
             assert self.client is not None
-            fut = self.client.fetch(new_request, raise_error=False)
+            # A followed redirect is a continuation of the already-admitted
+            # fetch, so it must not pass through the policy gates again.
+            fut = self.client._fetch_continuation(new_request)
             fut.add_done_callback(lambda f: final_callback(f.result()))
             self._on_end_request()
             return

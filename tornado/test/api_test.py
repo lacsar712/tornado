@@ -52,9 +52,26 @@ def _submodules(package: types.ModuleType) -> list[str]:
 
 MODULES = sorted(["tornado"] + _submodules(tornado) + _submodules(tornado.platform))
 
-# Names that a module-level ``__getattr__`` creates on demand. This is the
-# only one, so it's listed here instead of being found automatically.
-_LAZY_NAMES = {"tornado.platform.asyncio": ["AnyThreadEventLoopPolicy"]}
+# Names that a module-level ``__getattr__`` creates on demand.
+_LAZY_NAMES = {
+    "tornado.platform.asyncio": ["AnyThreadEventLoopPolicy"],
+    # The outbound policy stack lives in tornado.httpclient_policy and is
+    # re-exported lazily from tornado.httpclient to avoid an import cycle.
+    "tornado.httpclient": [
+        "FetchAdmit",
+        "OutboundFetchDenied",
+        "OutboundPolicyConflict",
+        "OutboundPolicyError",
+        "OutboundPolicyFrame",
+        "OutboundQueueFull",
+        "QueueGate",
+        "TimeoutGate",
+        "current_outbound_policy",
+        "outbound_policy",
+        "pop_outbound_policy",
+        "push_outbound_policy",
+    ],
+}
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "api.txt")
 

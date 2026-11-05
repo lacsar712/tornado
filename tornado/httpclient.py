@@ -280,6 +280,25 @@ class AsyncHTTPClient(Configurable):
            `HTTPError` raised when a non-200 response code is used,
            instead of suppressing all errors.
         """
+        return self._fetch(request, raise_error, kwargs, apply_policy=True)
+
+    def _fetch_continuation(self, request: "HTTPRequest") -> "Future[HTTPResponse]":
+        """Internal re-entry point for a fetch continuation (e.g. redirects).
+
+        Redirects followed by an implementation are part of an already
+        admitted fetch, so they must not pass through the outbound policy
+        admission/queue gates again. Timeouts keep their ordinary semantics
+        for the continuation.
+        """
+        return self._fetch(request, False, {}, apply_policy=False)
+
+    def _fetch(
+        self,
+        request: Union[str, "HTTPRequest"],
+        raise_error: bool,
+        kwargs: dict[str, Any],
+        apply_policy: bool,
+    ) -> "Future[HTTPResponse]":
         if self._closed:
             raise RuntimeError("fetch() called on closed AsyncHTTPClient")
         if not isinstance(request, HTTPRequest):
@@ -302,6 +321,31 @@ class AsyncHTTPClient(Configurable):
                     future_set_exception_unless_cancelled(future, response.error)
                     return
             future_set_result_unless_cancelled(future, response)
+
+        if apply_policy:
+            from tornado import httpclient_policy
+
+            view = httpclient_policy._resolve(request_proxy)
+            if view is not None and view.deny_gate is not None:
+                # The fetch was refused admission. It never reaches the
+                # implementation: no queue slot, no curl handle, and
+                # in-flight requests are left untouched.
+                denied = httpclient_policy.OutboundFetchDenied(
+                    "outbound fetch rejected by the active "
+                    f"fetch_admit={view.deny_gate} policy frame",
+                    gate=view.deny_gate,
+                )
+                self.io_loop.add_callback(
+                    handle_response,
+                    HTTPResponse(
+                        cast(HTTPRequest, request_proxy),
+                        599,
+                        error=denied,
+                        start_time=time.time(),
+                    ),
+                )
+                return future
+            request_proxy._policy_view = view
 
         self.fetch_impl(cast(HTTPRequest, request_proxy), handle_response)
         return future
@@ -743,11 +787,28 @@ class _RequestProxy:
     Used internally by AsyncHTTPClient implementations.
     """
 
+    # Names through which the outbound policy stack overrides the merged
+    # request/defaults values for a single fetch.
+    _POLICY_TIMEOUT_ATTRS = ("connect_timeout", "request_timeout")
+
     def __init__(self, request: HTTPRequest, defaults: dict[str, Any] | None) -> None:
         self.request = request
         self.defaults = defaults
+        # Resolved outbound policy view for this fetch, or None when no
+        # policy frame is active. Attached per-call by AsyncHTTPClient.fetch;
+        # never mutates client defaults or HTTPRequest defaults.
+        self._policy_view: Any = None
 
     def __getattr__(self, name: str) -> Any:
+        if name in self._POLICY_TIMEOUT_ATTRS:
+            view = self.__dict__.get("_policy_view")
+            configured = self._configured_value(name)
+            if view is not None:
+                return view.effective_timeout(name, configured)
+            return configured
+        return self._configured_value(name)
+
+    def _configured_value(self, name: str) -> Any:
         request_attr = getattr(self.request, name)
         if request_attr is not None:
             return request_attr
@@ -755,6 +816,36 @@ class _RequestProxy:
             return self.defaults.get(name, None)
         else:
             return None
+
+
+# Outbound request policy stack re-exported lazily from
+# ``tornado.httpclient_policy`` (kept lazy because that module imports
+# HTTPClientError from this one). These names are also imported directly
+# from ``tornado.httpclient_policy``.
+_POLICY_EXPORTS = frozenset(
+    {
+        "FetchAdmit",
+        "TimeoutGate",
+        "QueueGate",
+        "OutboundPolicyFrame",
+        "OutboundPolicyError",
+        "OutboundFetchDenied",
+        "OutboundQueueFull",
+        "OutboundPolicyConflict",
+        "push_outbound_policy",
+        "pop_outbound_policy",
+        "outbound_policy",
+        "current_outbound_policy",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _POLICY_EXPORTS:
+        from tornado import httpclient_policy
+
+        return getattr(httpclient_policy, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def main() -> None:

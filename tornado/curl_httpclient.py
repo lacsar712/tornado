@@ -28,7 +28,7 @@ from typing import Any
 
 import pycurl
 
-from tornado import gen, httputil, ioloop
+from tornado import gen, httpclient_policy, httputil, ioloop
 from tornado.escape import native_str, utf8
 from tornado.httpclient import (
     AsyncHTTPClient,
@@ -212,6 +212,21 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
     def fetch_impl(
         self, request: HTTPRequest, callback: Callable[[HTTPResponse], None]
     ) -> None:
+        view = getattr(request, "_policy_view", None)
+        if httpclient_policy._fail_fast_active(view) and not self._free_list:
+            # All curl handles are busy, so the request would wait in the
+            # handle-pool queue; the active frame fails it immediately
+            # without taking a queue slot.
+            error = httpclient_policy.OutboundQueueFull(
+                "outbound fetch failed fast by queue_gate=fail_fast policy "
+                f"frame: client already at max_clients={len(self._curls)} "
+                "capacity",
+                gate=httpclient_policy.QueueGate.FAIL_FAST.value,
+            )
+            self.io_loop.add_callback(
+                callback, HTTPResponse(request=request, code=599, error=error)
+            )
+            return
         self._requests.append((request, callback, self.io_loop.time()))
         self._process_queue()
         self._set_timeout(0)
@@ -336,6 +351,10 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                     "queue_start_time": queue_start_time,
                     "curl_start_time": time.time(),
                     "curl_start_ioloop_time": self.io_loop.current().time(),
+                    # Outbound policy view for this request (or None) and
+                    # whether its timeout was registered as armed.
+                    "policy_view": getattr(request, "_policy_view", None),
+                    "policy_armed": False,
                 }
                 try:
                     self._curl_setup_request(
@@ -357,6 +376,14 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                     self._free_list.append(curl)
                     callback(HTTPResponse(request=request, code=599, error=e))
                 else:
+                    # connect/request timeouts start ticking when the
+                    # handle is added. 0 means "no timeout" (as used by a
+                    # freeze frame), in which case nothing is armed.
+                    if request.connect_timeout or request.request_timeout:
+                        httpclient_policy._timeout_will_arm(
+                            curl.info["policy_view"], "request"  # type: ignore
+                        )
+                        curl.info["policy_armed"] = True  # type: ignore
                     self._multi.add_handle(curl)
 
             if not started:
@@ -371,6 +398,8 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         info = curl.info  # type: ignore
         curl.info = None  # type: ignore
         self._multi.remove_handle(curl)
+        if info["policy_armed"]:
+            httpclient_policy._timeout_did_disarm(info["policy_view"], "request")
         streaming_buffer = info["streaming_buffer"]
         body_too_large = info["body_too_large"]
         if streaming_buffer is not None:
