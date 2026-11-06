@@ -26,7 +26,7 @@ import zlib
 from collections.abc import Awaitable, Callable
 from typing import Optional, Type, cast
 
-from tornado import gen, httputil, iostream
+from tornado import gen, httputil, inbound, iostream
 from tornado.concurrent import (
     Future,
     future_add_done_callback,
@@ -415,6 +415,11 @@ class HTTP1Connection(httputil.HTTPConnection):
         self._clear_callbacks()
         stream = self.stream
         self.stream = None  # type: ignore
+        # The segment continues as a detached session (e.g. WebSocket);
+        # policy frames stay live for open()/on_message() processing.
+        stack = inbound.policy_stack(self)
+        if stack is not None:
+            stack.note_detach()
         if not self._finish_future.done():
             future_set_result_unless_cancelled(self._finish_future, None)
         return stream
@@ -458,6 +463,16 @@ class HTTP1Connection(httputil.HTTPConnection):
             assert self._request_headers is not None
             self._response_start_line = start_line
             lines.append(utf8("HTTP/1.1 %d %s" % (start_line[1], start_line[2])))
+            # The inbound conn_continue policy can force the connection to
+            # close after this response even when HTTP keep-alive would
+            # otherwise allow another request. Decided before headers are
+            # emitted so the "Connection: close" header below reflects it.
+            server_eff = inbound.effective_policy(self)
+            if server_eff.conn_continue is inbound.ConnContinue.FORCE_CLOSE:
+                self._disconnect_on_finish = True
+                stack = inbound.policy_stack(self)
+                if stack is not None:
+                    stack.commit_force_close()
             self._chunking_output = (
                 # TODO: should this use
                 # self._request_start_line.version or
@@ -571,6 +586,20 @@ class HTTP1Connection(httputil.HTTPConnection):
                 self._pending_write = self.stream.write(b"0\r\n\r\n")
                 self._pending_write.add_done_callback(self._on_write_complete)
         self._write_finished = True
+        if not self.is_client:
+            # Re-read the inbound conn_continue policy at the actual end
+            # of the response: a force_close frame pushed during handler
+            # execution still keeps the next request loop iteration from
+            # running. The response-done phase is also recorded here so a
+            # later force_close push is rejected instead of ignored.
+            eff = inbound.effective_policy(self)
+            stack = inbound.policy_stack(self)
+            if eff.conn_continue is inbound.ConnContinue.FORCE_CLOSE:
+                self._disconnect_on_finish = True
+                if stack is not None:
+                    stack.commit_force_close()
+            if stack is not None:
+                stack.mark_response_done()
         # If the app finished the request while we're still reading,
         # divert any remaining data away from the delegate and
         # close the connection when we're done sending our response.
@@ -948,6 +977,12 @@ class HTTP1ServerConnection:
     ) -> None:
         try:
             while True:
+                # One segment per request. Leftover frames from a prior
+                # segment are popped here so keep-alive requests (and
+                # exception paths) can never inherit a stale view.
+                stack = inbound.policy_stack(self.context)
+                if stack is not None:
+                    stack.begin_segment()
                 conn = HTTP1Connection(self.stream, False, self.params, self.context)
                 request_delegate = delegate.start_request(self, conn)
                 try:
@@ -963,6 +998,12 @@ class HTTP1ServerConnection:
                     conn.close()
                     return
                 if not ret:
+                    return
+                # Read conn_continue for the segment that just ended:
+                # force_close keeps us from entering another loop round
+                # even if the stream happens to still be open.
+                if stack is not None and stack.should_end_connection():
+                    conn.close()
                     return
                 await asyncio.sleep(0)
         finally:

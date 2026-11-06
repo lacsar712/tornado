@@ -39,6 +39,7 @@ __all__ = [
     "httpclient",
     "httpserver",
     "httputil",
+    "inbound",
     "ioloop",
     "iostream",
     "locale",

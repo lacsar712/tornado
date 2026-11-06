@@ -34,7 +34,7 @@ from typing import (
 )
 
 import tornado
-from tornado import gen, httpclient, httputil, simple_httpclient
+from tornado import gen, httpclient, httputil, inbound, simple_httpclient
 from tornado.concurrent import (
     Future,
     future_add_done_callback,
@@ -239,6 +239,18 @@ class WebSocketHandler(tornado.web.RequestHandler):
         self.open_args = args
         self.open_kwargs = kwargs
 
+        # Read upgrade_surface at the handshake entry point. A
+        # deny_upgrade frame fails through the ordinary HTTP error exit
+        # (set_status + finish) and never reaches open(); a frame pushed
+        # later than accept_connection is rejected at push time.
+        eff = self.inbound_effective
+        if eff.upgrade_surface is inbound.UpgradeSurface.DENY_UPGRADE:
+            self.set_status(403)
+            log_msg = "WebSocket upgrade denied by inbound policy"
+            gen_log.debug(log_msg)
+            self.finish(log_msg)
+            return
+
         # Upgrade header should be present and should be equal to WebSocket
         if self.request.headers.get("Upgrade", "").lower() != "websocket":
             self.set_status(400)
@@ -361,6 +373,13 @@ class WebSocketHandler(tornado.web.RequestHandler):
            Consistently raises `WebSocketClosedError`. Previously could
            sometimes raise `.StreamClosedError`.
         """
+        # Read upgrade_surface for the established (or refused) session.
+        eff = self.inbound_effective
+        if (
+            eff.upgrade_surface is inbound.UpgradeSurface.DENY_UPGRADE
+            and self.ws_connection is None
+        ):
+            raise WebSocketClosedError()
         if self.ws_connection is None or self.ws_connection.is_closing():
             raise WebSocketClosedError()
         if isinstance(message, dict):
@@ -512,6 +531,8 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
            Added the ``code`` and ``reason`` arguments.
         """
+        # Read upgrade_surface when the session is being taken down.
+        _ = self.inbound_effective
         if self.ws_connection:
             self.ws_connection.close(code, reason)
             self.ws_connection = None
@@ -661,6 +682,9 @@ class WebSocketProtocol(abc.ABC):
         self.stream: IOStream | None = None
         self.client_terminated = False
         self.server_terminated = False
+        # Number of on_message dispatches, used by the
+        # upgrade_surface=close_on_open_exc policy to identify the first.
+        self._on_message_dispatches = 0
 
     def _run_callback(
         self, callback: Callable[..., Any], *args: Any, **kwargs: Any
@@ -671,11 +695,15 @@ class WebSocketProtocol(abc.ABC):
         completes. On error (including cancellation), logs the exception and
         aborts the websocket connection. The returned Future never raises.
         """
+        # Read upgrade_surface on every callback dispatch (including
+        # successful on_message calls); it only changes behavior when the
+        # callback raises.
+        eff = inbound.effective_policy(self.handler)
         try:
             result = callback(*args, **kwargs)
         except (Exception, asyncio.CancelledError):
             self.handler.log_exception(*sys.exc_info())
-            self._abort()
+            self._handle_callback_failure(eff, callback)
             return None
         if result is None:
             return None
@@ -686,11 +714,42 @@ class WebSocketProtocol(abc.ABC):
                 f.result()
             except (Exception, asyncio.CancelledError):
                 self.handler.log_exception(*sys.exc_info())
-                self._abort()
+                self._handle_callback_failure(eff, callback)
             future_set_result_unless_cancelled(done_future, None)
 
         future_add_done_callback(gen.convert_yielded(result), on_done)
         return done_future
+
+    def _handle_callback_failure(
+        self, eff: "inbound.EffectivePolicy", callback: Callable[..., Any]
+    ) -> None:
+        """Apply upgrade_surface to a callback failure.
+
+        Under ``close_on_open_exc`` an uncaught exception in the *first*
+        ``on_message`` observably closes the session with a WebSocket
+        close frame instead of aborting the socket abruptly; everything
+        else keeps the default abort.
+        """
+        is_first_on_message = (
+            self._on_message_dispatches == 1
+            and getattr(callback, "__self__", None) is self.handler
+            and getattr(getattr(callback, "__func__", None), "__name__", None)
+            == "on_message"
+        )
+        if (
+            eff.upgrade_surface is inbound.UpgradeSurface.CLOSE_ON_OPEN_EXC
+            and is_first_on_message
+        ):
+            gen_log.warning(
+                "inbound upgrade_surface=close_on_open_exc: closing WebSocket "
+                "session after exception in first on_message"
+            )
+            try:
+                self.handler.close(1011, "internal error in on_message")
+                return
+            except Exception:
+                pass
+        self._abort()
 
     def on_connection_close(self) -> None:
         self._abort()
@@ -908,6 +967,20 @@ class WebSocketProtocol13(WebSocketProtocol):
         self._selected_subprotocol = value
 
     async def accept_connection(self, handler: WebSocketHandler) -> None:
+        # The handshake upgrade is now irrevocably underway; a later
+        # deny_upgrade push must be rejected by the policy stack.
+        stack = inbound.policy_stack(handler)
+        if stack is not None:
+            stack.mark_ws_accept_begun()
+        # Read upgrade_surface here too (defense in depth for callers
+        # that bypassed WebSocketHandler.get's HTTP error exit).
+        eff = inbound.effective_policy(handler)
+        if eff.upgrade_surface is inbound.UpgradeSurface.DENY_UPGRADE:
+            handler.set_status(403)
+            log_msg = "WebSocket upgrade denied by inbound policy"
+            gen_log.debug(log_msg)
+            handler.finish(log_msg)
+            return
         try:
             self._handle_websocket_headers(handler)
         except ValueError:
@@ -1002,13 +1075,29 @@ class WebSocketProtocol13(WebSocketProtocol):
         self.stream = handler._detach_stream()
 
         self.start_pinging()
+        # Read upgrade_surface around open(); the value decides how an
+        # uncaught open exception is presented for this session.
+        eff = inbound.effective_policy(handler)
         try:
             open_result = handler.open(*handler.open_args, **handler.open_kwargs)
             if open_result is not None:
                 await open_result
         except Exception:
             handler.log_exception(*sys.exc_info())
-            self._abort()
+            # close_on_open_exc performs an observable orderly WebSocket
+            # close (close frame, 1011) instead of dropping the socket
+            # half-open; honor_ws keeps the existing abrupt abort.
+            if eff.upgrade_surface is inbound.UpgradeSurface.CLOSE_ON_OPEN_EXC:
+                gen_log.warning(
+                    "inbound upgrade_surface=close_on_open_exc: closing "
+                    "WebSocket session after open() exception"
+                )
+                try:
+                    handler.close(1011, "internal error while opening")
+                except Exception:
+                    self._abort()
+            else:
+                self._abort()
             return
 
         await self._receive_frame_loop()
@@ -1293,10 +1382,12 @@ class WebSocketProtocol13(WebSocketProtocol):
             except UnicodeDecodeError:
                 self._abort()
                 return None
+            self._on_message_dispatches += 1
             return self._run_callback(self.handler.on_message, decoded)
         elif opcode == 0x2:
             # Binary data
             self._message_bytes_in += len(data)
+            self._on_message_dispatches += 1
             return self._run_callback(self.handler.on_message, data)
         elif opcode == 0x8:
             # Close

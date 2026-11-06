@@ -84,7 +84,7 @@ from io import BytesIO
 from urllib.parse import urlencode
 
 import tornado
-from tornado import escape, gen, httputil, iostream, locale, template
+from tornado import escape, gen, httputil, inbound, iostream, locale, template
 from tornado.concurrent import Future, future_set_result_unless_cancelled
 from tornado.escape import _unicode, utf8
 from tornado.httpserver import HTTPServer
@@ -255,6 +255,34 @@ class RequestHandler:
         """An alias for `self.application.settings <Application.settings>`."""
         return self.application.settings
 
+    @property
+    def inbound_effective(self) -> "inbound.EffectivePolicy":
+        """The live read-only inbound policy view for this request.
+
+        Merges the policy stack frames on the current connection with
+        ``Application.settings``, the connection parameters and this
+        handler's state. Available from ``initialize``/``prepare`` and
+        the HTTP methods (and throughout the WebSocket handshake and
+        session). Returns the default ``honor_*`` view when no frame has
+        been pushed, in which case behavior is unchanged.
+        """
+        return inbound.effective_policy(self)
+
+    def _inbound_stack(self) -> "inbound.RequestPolicyStack | None":
+        return inbound.policy_stack(self)
+
+    def _inbound_body_streaming(self) -> bool:
+        # The class decorator opts in permanently; a body_admit=
+        # force_stream frame (latched at headers_received) opts in for
+        # this segment even without the decorator. reject_body wins over
+        # the decorator for the segment.
+        eff = self.inbound_effective
+        if eff.body_admit is inbound.BodyAdmit.FORCE_STREAM:
+            return True
+        if eff.body_admit is inbound.BodyAdmit.REJECT_BODY:
+            return False
+        return _has_stream_request_body(self.__class__)
+
     def _unimplemented_method(self, *args: str, **kwargs: str) -> None:
         raise HTTPError(405)
 
@@ -311,10 +339,22 @@ class RequestHandler:
         may not be called promptly after the end user closes their
         connection.
         """
-        if _has_stream_request_body(self.__class__):
-            if not self.request._body_future.done():
-                self.request._body_future.set_exception(iostream.StreamClosedError())
-                self.request._body_future.exception()
+        # Read the inbound policy on the disconnect path: body_admit
+        # decides whether a streaming body future exists to unblock;
+        # write_fault only governs output, which is abandoned here.
+        eff = self.inbound_effective
+        if self._inbound_body_streaming():
+            body_future = getattr(self.request, "_body_future", None)
+            if body_future is not None and not body_future.done():
+                body_future.set_exception(iostream.StreamClosedError())
+                body_future.exception()
+        if eff.write_fault is inbound.WriteFault.FAIL_FLUSH:
+            # The connection was torn down by the fail_flush policy; no
+            # buffered output is in flight, so there is nothing to flush.
+            gen_log.debug(
+                "inbound write_fault=fail_flush: connection closed for %s",
+                self._request_summary(),
+            )
 
     def clear(self) -> None:
         """Resets all headers and content for this response."""
@@ -996,6 +1036,11 @@ class RequestHandler:
             self.set_header("Content-Type", "application/json; charset=UTF-8")
         chunk = utf8(chunk)
         self._write_buffer.append(chunk)
+        # Output has started (even before a flush), so a fail_flush frame
+        # can no longer be pushed for this segment.
+        stack = self._inbound_stack()
+        if stack is not None:
+            stack.mark_writes_begun()
 
     def render(self, template_name: str, **kwargs: Any) -> "Future[None]":
         """Renders the template with the given arguments as the response.
@@ -1218,6 +1263,27 @@ class RequestHandler:
            The ``callback`` argument was removed.
         """
         assert self.request.connection is not None
+        # Read write_fault on every flush (the single output chokepoint).
+        eff = self.inbound_effective
+        if eff.write_fault is inbound.WriteFault.FAIL_FLUSH:
+            # Nothing may reach the client: report the failed write on
+            # the returned Future and close the connection so buffered
+            # output cannot be mistaken for delivered output.
+            gen_log.warning(
+                "inbound write_fault=fail_flush: suppressing response for %s",
+                self._request_summary(),
+            )
+            failed_future: Future[None] = Future()
+            failed_future.set_exception(
+                inbound.InboundFlushError("flush blocked by inbound fail_flush policy")
+            )
+            # Mark the exception retrieved to avoid GC warnings.
+            failed_future.exception()
+            self.request.connection.close()  # type: ignore
+            return failed_future
+        stack = self._inbound_stack()
+        if stack is not None:
+            stack.mark_writes_begun()
         chunk = b"".join(self._write_buffer)
         self._write_buffer = []
         if not self._headers_written:
@@ -1280,6 +1346,15 @@ class RequestHandler:
         """
         if self._finished:
             raise RuntimeError("finish() called twice")
+
+        # Read the full merged view at the response boundary (body_admit
+        # and write_fault included): conn_continue=force_close can no
+        # longer be pushed, while the connection layer re-reads the live
+        # policy below and honors a frame that is already in place.
+        eff = self.inbound_effective
+        stack = eff.stack
+        if stack is not None:
+            stack.mark_response_done()
 
         if chunk is not None:
             self.write(chunk)
@@ -1352,6 +1427,8 @@ class RequestHandler:
         Override `write_error()` to customize the error page that is returned.
         Additional keyword arguments are passed through to `write_error`.
         """
+        # Read write_fault on the error path.
+        eff = self.inbound_effective
         if self._headers_written:
             gen_log.error("Cannot send error response after headers written")
             if not self._finished:
@@ -1372,6 +1449,18 @@ class RequestHandler:
             if isinstance(exception, HTTPError) and exception.reason:
                 reason = exception.reason
         self.set_status(status_code, reason=reason)
+        if eff.write_fault is inbound.WriteFault.DROP_ON_ERROR:
+            # Keep the observable status code (and a log fork) but do not
+            # write any error page body.
+            gen_log.warning(
+                "inbound write_fault=drop_on_error: status %d for %s, "
+                "error body suppressed",
+                status_code,
+                self._request_summary(),
+            )
+            if not self._finished:
+                self.finish()
+            return
         try:
             if status_code != 304:
                 self.write_error(status_code, **kwargs)
@@ -1392,7 +1481,18 @@ class RequestHandler:
         the "current" exception for purposes of methods like
         ``sys.exc_info()`` or ``traceback.format_exc``.
         """
-        if self._should_not_send_content(status_code):
+        # write_error is the second read site for write_fault, so direct
+        # calls to it suppress the error page body under drop_on_error.
+        eff = self.inbound_effective
+        if eff.write_fault is inbound.WriteFault.DROP_ON_ERROR:
+            gen_log.warning(
+                "inbound write_fault=drop_on_error: write_error(%d) body "
+                "suppressed for %s",
+                status_code,
+                self._request_summary(),
+            )
+            self.finish()
+        elif self._should_not_send_content(status_code):
             self.finish()
         elif self.settings.get("serve_traceback") and "exc_info" in kwargs:
             # in debug mode, try to send a traceback
@@ -1965,8 +2065,18 @@ class RequestHandler:
             if self.request.method not in self.SUPPORTED_METHODS:
                 raise HTTPError(405)
 
+            # Read the inbound policy at the top of _execute: body_admit
+            # decides body parsing/delivery; write_fault takes effect at
+            # flush() below. The view is live (not an entry snapshot).
+            eff = self.inbound_effective
+            if eff.body_admit is inbound.BodyAdmit.FORCE_STREAM:
+                body_streaming = True
+            elif eff.body_admit is inbound.BodyAdmit.REJECT_BODY:
+                body_streaming = False
+            else:
+                body_streaming = _has_stream_request_body(self.__class__)
             # If we're not in stream_request_body mode, this is the place where we parse the body.
-            if not _has_stream_request_body(self.__class__):
+            if not body_streaming:
                 try:
                     self.request._parse_body()
                 except httputil.HTTPInputError as e:
@@ -1979,6 +2089,10 @@ class RequestHandler:
             # XSRF checks (if enabled): cookie-based and/or cross-origin protection.
             self._cross_origin_protection()
 
+            # Re-read before prepare() so prepare/get/post (and nested
+            # middleware calls) observe the current stack, including inner
+            # frames pushed during initialization.
+            eff = self.inbound_effective
             result = self.prepare()
             if result is not None:
                 result = await result  # type: ignore
@@ -1989,7 +2103,7 @@ class RequestHandler:
             if self._finished:
                 return
 
-            if _has_stream_request_body(self.__class__):
+            if self._inbound_body_streaming():
                 # In streaming mode request.body is a Future that signals
                 # the body has been completely received.  The Future has no
                 # result; the data has been passed to self.data_received
@@ -1999,6 +2113,10 @@ class RequestHandler:
                 except iostream.StreamClosedError:
                     return
 
+            # Re-read before the HTTP method and auto-finish, so frames
+            # pushed during prepare() are honored by get/post and by the
+            # implicit finish().
+            eff = self.inbound_effective
             method = getattr(self, self.request.method.lower())
             result = method(*self.path_args, **self.path_kwargs)
             if result is not None:
@@ -2602,26 +2720,55 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
         self.path_kwargs = path_kwargs or {}
         self.chunks = bytearray()
         self.stream_request_body = _has_stream_request_body(self.handler_class)
+        # Effective per-segment body mode, decided in headers_received.
+        self._body_streaming = False
+        self._reject_body = False
 
     def headers_received(
         self,
         start_line: httputil.RequestStartLine | httputil.ResponseStartLine,
         headers: httputil.HTTPHeaders,
     ) -> Awaitable[None] | None:
-        if self.stream_request_body:
+        # Read body_admit exactly once, at the headers decision point,
+        # and latch it on the segment. A force_stream frame pushed after
+        # this point is rejected by the stack instead of being silently
+        # ignored; an earlier decision cannot be remade mid-body.
+        eff = inbound.effective_policy(self.request)
+        stack = inbound.policy_stack(self.request)
+        if stack is not None:
+            stack.mark_body_decision(eff.body_admit)
+        if eff.body_admit is inbound.BodyAdmit.REJECT_BODY:
+            # No early execute; incoming body bytes fail data_received.
+            self._body_streaming = False
+            self._reject_body = True
+        elif eff.body_admit is inbound.BodyAdmit.FORCE_STREAM:
+            # Stream even though the handler class is not decorated.
+            self._body_streaming = True
+            self._reject_body = False
+        else:
+            self._body_streaming = self.stream_request_body
+            self._reject_body = False
+        if self._body_streaming:
             self.request._body_future = Future()
             return self.execute()
         return None
 
     def data_received(self, data: bytes) -> Awaitable[None] | None:
-        if self.stream_request_body:
+        if self._body_streaming:
             return self.handler.data_received(data)
+        elif self._reject_body:
+            # Observable failure (HTTP1Connection turns HTTPInputError
+            # into a 400 response + connection close); never buffer and
+            # never present the body as an empty success.
+            raise httputil.HTTPInputError(
+                "request body rejected by inbound body_admit policy"
+            )
         else:
             self.chunks += data
             return None
 
     def finish(self) -> None:
-        if self.stream_request_body:
+        if self._body_streaming:
             future_set_result_unless_cancelled(self.request._body_future, None)
         else:
             # Note that the body gets parsed in RequestHandler._execute so it can be in
@@ -2630,7 +2777,7 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
             self.execute()
 
     def on_connection_close(self) -> None:
-        if self.stream_request_body:
+        if self._body_streaming:
             self.handler.on_connection_close()
         else:
             self.chunks = None  # type: ignore
@@ -2654,7 +2801,7 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
         )
         transforms = [t(self.request) for t in self.application.transforms]
 
-        if self.stream_request_body:
+        if self._body_streaming:
             self.handler._prepared_future = Future()
         # Note that if an exception escapes handler._execute it will be
         # trapped in the Future it returns (which we are ignoring here,

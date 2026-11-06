@@ -31,7 +31,7 @@ import typing
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from tornado import httputil, iostream, netutil
+from tornado import httputil, inbound, iostream, netutil
 from tornado.escape import native_str
 from tornado.http1connection import HTTP1ConnectionParameters, HTTP1ServerConnection
 from tornado.tcpserver import TCPServer
@@ -233,6 +233,10 @@ class HTTPServer(TCPServer, Configurable, httputil.HTTPServerConnectionDelegate)
         context = _HTTPRequestContext(
             stream, address, self.protocol, self.trusted_downstream
         )
+        # Each TCP connection gets its own inbound policy stack; frames
+        # pushed while handling one connection can never be visible on a
+        # concurrent connection.
+        inbound.bind_policy_stack(context)
         conn = HTTP1ServerConnection(stream, self.conn_params, context)
         self._connections.add(conn)
         conn.start_serving(self)
@@ -378,6 +382,7 @@ class _ProxyAdapter(httputil.HTTPMessageDelegate):
     ) -> None:
         self.connection = request_conn
         self.delegate = delegate
+        self._sticky_xheaders = False
 
     def headers_received(
         self,
@@ -387,21 +392,52 @@ class _ProxyAdapter(httputil.HTTPMessageDelegate):
         # TODO: either make context an official part of the
         # HTTPConnection interface or figure out some other way to do this.
         self.connection.context._apply_xheaders(headers)  # type: ignore
-        return self.delegate.headers_received(start_line, headers)
+        # xheaders are per-request. The conn_continue policy dimension
+        # may demand strict (sticky) isolation from the next request on
+        # this connection; latch that decision here, at apply time.
+        stack = inbound.policy_stack(self.connection)
+        if stack is not None:
+            sticky = (
+                inbound.effective_policy(self.connection).conn_continue
+                is inbound.ConnContinue.STICKY_XHEADERS
+            )
+            stack.note_xheaders_applied(sticky)
+            self._sticky_xheaders = sticky
+        else:
+            self._sticky_xheaders = False
+        try:
+            return self.delegate.headers_received(start_line, headers)
+        except BaseException:
+            # The inner delegate failed before arranging its own cleanup;
+            # applied xheaders must still not leak to the next segment.
+            self._cleanup()
+            raise
 
     def data_received(self, chunk: bytes) -> Awaitable[None] | None:
         return self.delegate.data_received(chunk)
 
     def finish(self) -> None:
-        self.delegate.finish()
-        self._cleanup()
+        try:
+            self.delegate.finish()
+        finally:
+            self._cleanup()
 
     def on_connection_close(self) -> None:
-        self.delegate.on_connection_close()
-        self._cleanup()
+        try:
+            self.delegate.on_connection_close()
+        finally:
+            self._cleanup()
 
     def _cleanup(self) -> None:
         self.connection.context._unapply_xheaders()  # type: ignore
+        stack = inbound.policy_stack(self.connection)
+        if stack is not None and (
+            self._sticky_xheaders
+            or stack.segment.sticky_xheaders
+            or inbound.effective_policy(self.connection).conn_continue
+            is inbound.ConnContinue.STICKY_XHEADERS
+        ):
+            stack.note_xheaders_restored()
 
 
 HTTPRequest = httputil.HTTPServerRequest
